@@ -313,8 +313,17 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 endif()
 
 if(EXECUTORCH_OPTIMIZE_SIZE)
-  # -Os: Optimize for size.
-  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -Os")
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    # TODO: Restore -Os after the LLVM register coalescer crash is fixed:
+    # https://github.com/llvm/llvm-project/issues/229400
+    set(_executorch_size_optimization_flag -Oz)
+  else()
+    set(_executorch_size_optimization_flag -Os)
+  endif()
+  set(CMAKE_CXX_FLAGS_RELEASE
+      "${CMAKE_CXX_FLAGS_RELEASE} ${_executorch_size_optimization_flag}"
+  )
+  unset(_executorch_size_optimization_flag)
 else()
   # -O2: Moderate opt.
   set(CMAKE_CXX_FLAGS_RELEASE "-O2 ${CMAKE_CXX_FLAGS_RELEASE}")
