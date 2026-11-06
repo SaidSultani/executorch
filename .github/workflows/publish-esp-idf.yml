@@ -1,7 +1,8 @@
 name: Publish ESP-IDF component
 
 # Publishes pytorch/executorch to the ESP Component Registry: RC tags to the
-# staging registry, release tags to staging and then production. The archive
+# staging registry, release tags to staging and then production, and on demand
+# a dev version of a nightly branch commit for early adopters. The archive
 # is built and tested on the ESP-IDF releases the component supports before
 # any upload, and each upload is followed by a consumer build that resolves
 # the version from that registry. See the release runbook in
@@ -14,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       version_suffix:
-        description: 'Version suffix: empty at a release tag, -rc.N at an RC tag, ~N for a packaging respin on release/X.Y'
+        description: 'Version suffix: empty at a release tag, -rc.N at an RC tag, ~N for a packaging respin on release/X.Y, -dev for the dev version of the nightly branch'
         type: string
         default: ''
       registry:
@@ -33,6 +34,7 @@ on:
       - .github/workflows/publish-esp-idf.yml
       - .ci/scripts/upload_espressif_idf_component.sh
       - .ci/scripts/espressif_idf_upload_requirements.txt
+      - .ci/scripts/test_espressif_idf_nightly.sh
 
 # Runs for one tag or branch go one at a time; runs for different ones, such as
 # an RC awaiting approval and its release, do not hold each other up.
@@ -59,6 +61,7 @@ jobs:
         shell: bash
         env:
           EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
           REF_NAME: ${{ github.ref_name }}
           VERSION_SUFFIX: ${{ inputs.version_suffix }}
           REGISTRY: ${{ inputs.registry }}
@@ -79,8 +82,18 @@ jobs:
               fi
               ;;
             workflow_dispatch)
-              if [[ ! "${VERSION_SUFFIX}" =~ ^(-rc\.[1-9][0-9]*|~[1-9][0-9]*)?$ ]]; then
-                echo "::error::version_suffix must be empty, -rc.N or ~N, not '${VERSION_SUFFIX}'."
+              if [[ ! "${VERSION_SUFFIX}" =~ ^(-rc\.[1-9][0-9]*|~[1-9][0-9]*|-dev)?$ ]]; then
+                echo "::error::version_suffix must be empty, -rc.N, ~N or -dev, not '${VERSION_SUFFIX}'."
+                exit 1
+              fi
+              # A dev version's users install the nightly wheel of its commit.
+              if [[ "${VERSION_SUFFIX}" == -dev && "${REF}" != refs/heads/nightly ]]; then
+                echo "::error::a dev version is published from the nightly branch, not ${REF}."
+                exit 1
+              fi
+              # The environment trusts the nightly branch for dev versions only.
+              if [[ "${REF}" == refs/heads/nightly && "${VERSION_SUFFIX}" != -dev ]]; then
+                echo "::error::the nightly branch publishes dev versions only, with version_suffix -dev."
                 exit 1
               fi
               if [[ "${VERSION_SUFFIX}" == -rc.* && "${REGISTRY}" == production ]]; then
@@ -136,25 +149,67 @@ jobs:
         unset SCCACHE_BUCKET SCCACHE_S3_KEY_PREFIX
         CONDA_ENV=$(conda env list --json | jq -r '.envs | .[-1]')
         conda activate "${CONDA_ENV}"
+        nightly=.ci/scripts/test_espressif_idf_nightly.sh
+        suffix="${{ needs.plan.outputs.suffix }}"
+        # A tag names its version; a dispatch appends its suffix to version.txt.
+        expected="${{ needs.plan.outputs.version }}"
+        expected="${expected:-$(cat version.txt)${suffix}}"
+        # Before the build: a dev version's users install the nightly wheels of
+        # its commit.
+        if [[ "${suffix}" == -dev ]]; then
+          expected=$(bash examples/espressif/build_idf_component.sh --version --version-suffix -dev)
+          bash "${nightly}" wheel "${RUNNER_ARTIFACT_DIR}" "${expected}" "$(git rev-parse HEAD)"
+        fi
         source .ci/scripts/utils.sh
         install_executorch --use-pt-pinned-commit --minimal
         if [[ "${{ needs.plan.outputs.rehearsal }}" == true ]]; then
           # A pull request rehearses the release stamp at a throwaway local tag.
           git tag -f "v$(cat version.txt)"
         fi
-        # A tag names its version; a dispatch appends its suffix to version.txt.
-        expected="${{ needs.plan.outputs.version }}"
-        expected="${expected:-$(cat version.txt)${{ needs.plan.outputs.suffix }}}"
-        bash .ci/scripts/test_espressif_idf_nightly.sh prepare "${RUNNER_ARTIFACT_DIR}" \
-          --version-suffix "${{ needs.plan.outputs.suffix }}"
+        bash "${nightly}" prepare "${RUNNER_ARTIFACT_DIR}" --version-suffix "${suffix}"
         version=$(cat "${RUNNER_ARTIFACT_DIR}/version")
         if [[ "${version}" != "${expected}" ]]; then
           echo "FAIL: generated version ${version}, expected ${expected}" >&2
           exit 1
         fi
+        bash "${nightly}" torch "${RUNNER_ARTIFACT_DIR}"
         echo "Packed pytorch/executorch ${version}"
         # Nothing downstream reads the unpacked component.
         rm -r "${RUNNER_ARTIFACT_DIR}/component"
+
+  # A pull request rehearses the dev version's wheel check on the latest
+  # finished nightly that has wheels. Nightly wheels fail to build for days at a
+  # time, so finding none only warns, and nothing waits on this job.
+  dev-wheel-rehearsal:
+    name: Rehearse the dev version's wheel check
+    needs: plan
+    if: needs.plan.outputs.rehearsal == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.11'
+      - run: |
+          set -euo pipefail
+          # The nightly index keeps about two months of wheels.
+          git fetch -q --shallow-since='61 days ago' origin \
+            +refs/heads/nightly:refs/remotes/origin/nightly
+          listing=$(curl -sSf https://download.pytorch.org/whl/nightly/cpu/executorch/)
+          today=$(date -u +%Y%m%d)
+          for commit in $(git rev-list --first-parent origin/nightly); do
+            day=$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y%m%d "${commit}")
+            version="$(git show "${commit}:version.txt")-dev.${day}"
+            if [[ "${day}" != "${today}" ]] \
+                && grep -qF "executorch-${version/-dev./.dev}" <<< "${listing}"; then
+              bash .ci/scripts/test_espressif_idf_nightly.sh wheel "${RUNNER_TEMP}/wheel" \
+                "${version}" "${commit}"
+              exit 0
+            fi
+          done
+          echo "::warning::no nightly of the last 60 days has wheels; the dev wheel check went unrehearsed."
 
   dry-run:
     name: Registry validation on ${{ matrix.registry }} (upload --dry-run)
